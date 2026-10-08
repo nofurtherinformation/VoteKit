@@ -7,6 +7,7 @@ from numpy.typing import NDArray
 
 from votekit.ballot_generator.bloc_slate_generator.config import BlocSlateConfig
 from votekit.pref_profile import RankProfile
+from votekit.types import Candidate
 
 
 def _lexicographic_symbol_tuple_iterator(
@@ -222,31 +223,48 @@ def _candidate_ids_to_profile(
     config: BlocSlateConfig,
     candidate_ids: NDArray,
     *,
+    tie_sets: Sequence[frozenset[Candidate]] = (),
     group_ballots: bool = True,
 ) -> RankProfile:
     """
     Build a RankProfile from an array of ballots given as candidate indices.
 
+    IDs 0 to n_candidates - 1 rank a single candidate, in ``config.candidates`` order. ID
+    n_candidates + i ranks the candidates in ``tie_sets[i]`` tied at that position. -1 leaves
+    the position empty.
+
     Args:
         config (BlocSlateConfig): Configuration object containing all necessary parameters for
             working with a bloc-slate ballot generator.
-        candidate_ids (NDArray): n_ballots x n_candidates array of indices into
-            ``config.candidates``, padded with -1.
+        candidate_ids (NDArray): n_ballots x n_candidates array of IDs as described above,
+            padded with -1.
+        tie_sets (Sequence[frozenset[Candidate]]): Distinct sets of two or more tied candidates.
+            Defaults to no ties.
         group_ballots (bool): If True, group identical ballots and set the weight accordingly.
             Defaults to True.
 
     Returns:
         RankProfile: A preference profile.
+
+    Raises:
+        ValueError: A tie set has fewer than two candidates or appears more than once.
     """
     n_candidates = len(config.candidates)
+
+    # a duplicate or single-candidate tie set would give one ranking two IDs, which np.unique
+    # would then count as different ballots
+    if any(len(tie) < 2 for tie in tie_sets) or len(set(tie_sets)) != len(tie_sets):
+        raise ValueError("tie_sets must be distinct sets of at least two candidates.")
 
     if group_ballots:
         candidate_ids, weights = np.unique(candidate_ids, axis=0, return_counts=True)
     else:
         weights = np.ones(len(candidate_ids), dtype=np.int64)
 
-    ranking_values = np.empty(n_candidates + 1, dtype=object)
-    ranking_values[:] = [frozenset("~")] + [frozenset((c,)) for c in config.candidates]
+    ranking_values = np.empty(n_candidates + 1 + len(tie_sets), dtype=object)
+    ranking_values[:] = (
+        [frozenset("~")] + [frozenset((c,)) for c in config.candidates] + list(tie_sets)
+    )
 
     df = pd.DataFrame(
         ranking_values[candidate_ids + 1],

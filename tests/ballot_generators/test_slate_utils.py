@@ -1,6 +1,13 @@
+import numpy as np
+import pytest
+
+from votekit.ballot import RankBallot
+from votekit.ballot_generator.bloc_slate_generator.config import BlocSlateConfig
 from votekit.ballot_generator.bloc_slate_generator.slate_utils import (
+    _candidate_ids_to_profile,
     _lexicographic_symbol_tuple_iterator,
 )
+from votekit.pref_profile import RankProfile
 
 
 def test_lexicographic_symbol_tuple_iterator_empty():
@@ -49,3 +56,32 @@ def test_lexicographic_symbol_tuple_iterator_with_more_duplicates():
         ("C", "B", "A", "A"),
     ]
     assert result == expected
+
+
+def test_candidate_ids_to_profile_with_ties():
+    config = BlocSlateConfig(
+        n_voters=3, slate_to_candidates={"A": ["a1", "a2"], "B": ["b1"]}, silent=True
+    )
+    a1_a2_tie = 3  # n_candidates + 0
+    candidate_ids = np.array(
+        [
+            [a1_a2_tie, 2, -1],
+            [a1_a2_tie, 2, -1],
+            [0, -1, -1],
+        ]
+    )
+
+    profile = _candidate_ids_to_profile(config, candidate_ids, tie_sets=[frozenset({"a1", "a2"})])
+
+    assert profile == RankProfile(
+        ballots=[
+            RankBallot(ranking=({"a1", "a2"}, {"b1"}), weight=2),
+            RankBallot(ranking=({"a1"},), weight=1),
+        ],
+        candidates=["a1", "a2", "b1"],
+        max_ranking_length=3,
+    )
+    assert profile.max_candidates_ranked == 3
+
+    with pytest.raises(ValueError, match="distinct sets of at least two candidates"):
+        _candidate_ids_to_profile(config, candidate_ids, tie_sets=[frozenset({"a1"})])
