@@ -29,3 +29,16 @@ def test_ranking_length_no_default():
     )
 
     assert profile.max_ranking_length == 4
+
+
+def test_max_candidates_ranked_repeats_and_ties():
+    # the repeated-candidate ballot has the most filled positions but ranks only one candidate
+    profile = RankProfile(
+        ballots=(
+            RankBallot(ranking=({"A"}, {"A"}, {"A"}, {"A"})),
+            RankBallot(ranking=({"B", "C"}, {"D"})),
+            RankBallot(ranking=({"B"},)),
+        ),
+        max_ranking_length=4,
+    )
+    assert profile.max_candidates_ranked == 3

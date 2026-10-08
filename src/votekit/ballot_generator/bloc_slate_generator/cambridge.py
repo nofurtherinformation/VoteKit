@@ -15,10 +15,13 @@ from typing import Optional
 import apportionment.methods as apportion
 import numpy as np
 from numpy.random import Generator
+from numpy.typing import NDArray
 
 from votekit.ballot_generator.bloc_slate_generator.config import BlocSlateConfig
 from votekit.ballot_generator.bloc_slate_generator.slate_utils import (
-    _convert_slate_ballots_to_profile,
+    _candidate_ids_to_profile,
+    _convert_slate_ballots_to_candidate_ids,
+    _encode_slate_ballots,
 )
 from votekit.pref_profile import RankProfile
 
@@ -40,7 +43,7 @@ def _sample_historical_slate_ballots(
     # majority/minority groups
     *,
     numpy_rng: Optional[Generator] = None,
-):
+) -> NDArray:
     """
     Sample historical slate ballots fort a given bloc using the Cambridge model.
 
@@ -65,8 +68,8 @@ def _sample_historical_slate_ballots(
             for reproducible results. Defaults to None for non-deterministic results.
 
     Returns:
-        list[tuple[str, ...]]: A list of slate ballots, where each ballot is a tuple of slate names
-            in the order they appear on that ballot.
+        NDArray: n_ballots x n_candidates array of slate ballots as indices into
+            ``config.slates``, padded with -1.
     """
     numpy_rng = np.random.default_rng() if numpy_rng is None else numpy_rng
 
@@ -92,22 +95,18 @@ def _sample_historical_slate_ballots(
         p=list(reduced_historical_minority_ballot_pmf.values()),
     )
 
-    slate_ballots = [
-        [
-            historical_slate_to_config_slate[historical_slate]
-            for historical_slate in hist_maj_ballots[slate_ballot_idx]
-        ]
-        for slate_ballot_idx in maj_slate_ballot_indices
-    ]
-    slate_ballots += [
-        [
-            historical_slate_to_config_slate[historical_slate]
-            for historical_slate in hist_min_ballots[slate_ballot_idx]
-        ]
-        for slate_ballot_idx in min_slate_ballot_indices
-    ]
+    def encode(hist_ballots: list[str]) -> NDArray:
+        return _encode_slate_ballots(
+            [[historical_slate_to_config_slate[h] for h in ballot] for ballot in hist_ballots],
+            config,
+        )
 
-    return slate_ballots
+    return np.concatenate(
+        [
+            encode(hist_maj_ballots)[maj_slate_ballot_indices],
+            encode(hist_min_ballots)[min_slate_ballot_indices],
+        ]
+    )
 
 
 def _reduce_ballot(original_slate_ballot: str, w_count: int, c_count: int) -> str:
@@ -205,9 +204,9 @@ def _inner_cambridge_sampler(
     minority_bloc: str,
     *,
     rng_seed: Optional[int] = None,
-) -> dict[str, RankProfile]:
+) -> dict[str, NDArray]:
     """
-    Inner function to generate profiles by bloc using Cambridge model.
+    Inner function to generate ballots by bloc using Cambridge model.
 
     Args:
         config (BlocSlateConfig): Configuration object containing all necessary parameters for
@@ -220,8 +219,8 @@ def _inner_cambridge_sampler(
             inputs. Seed set to None by default, different results will be generated each time.
 
     Returns:
-        dict[str, RankProfile]: A dictionary whose keys are bloc strings and values are
-            ``RankProfile`` objects representing the generated preference profiles for each bloc.
+        dict[str, NDArray]: A dictionary whose keys are bloc strings and values are
+            n_ballots x n_candidates arrays of indices into ``config.candidates``.
     """
     historical_slate_to_config_slate = {
         "W": majority_bloc,
@@ -261,7 +260,7 @@ def _inner_cambridge_sampler(
 
     bloc_lst = config.blocs
     ballots_per_bloc = {bloc: bloc_counts[i] for i, bloc in enumerate(bloc_lst)}
-    pref_profile_by_bloc = {b: RankProfile() for b in bloc_lst}
+    candidate_ids_by_bloc: dict[str, NDArray] = {}
     numpy_rng = np.random.default_rng(seed=rng_seed)
     for bloc in bloc_lst:
         slate_ballots = _sample_historical_slate_ballots(
@@ -275,11 +274,11 @@ def _inner_cambridge_sampler(
             numpy_rng=numpy_rng,
         )
 
-        pref_profile_by_bloc[bloc] = _convert_slate_ballots_to_profile(
+        candidate_ids_by_bloc[bloc] = _convert_slate_ballots_to_candidate_ids(
             config, bloc, slate_ballots, numpy_rng=numpy_rng
         )
 
-    return pref_profile_by_bloc
+    return candidate_ids_by_bloc
 
 
 def _validate_slates_and_blocs(
@@ -433,17 +432,17 @@ def cambridge_profiles_by_bloc_generator(
         config, majority_bloc, minority_bloc
     )
 
-    pp_by_bloc = _inner_cambridge_sampler(
+    candidate_ids_by_bloc = _inner_cambridge_sampler(
         config,
         majority_bloc,
         minority_bloc,
         rng_seed=rng_seed,
     )
 
-    if group_ballots:
-        for bloc, profile in pp_by_bloc.items():
-            pp_by_bloc[bloc] = profile.group_ballots()
-    return pp_by_bloc
+    return {
+        bloc: _candidate_ids_to_profile(config, candidate_ids, group_ballots=group_ballots)
+        for bloc, candidate_ids in candidate_ids_by_bloc.items()
+    }
 
 
 def cambridge_profile_generator(
@@ -492,21 +491,16 @@ def cambridge_profile_generator(
         config, majority_bloc, minority_bloc
     )
 
-    pp_by_bloc = _inner_cambridge_sampler(
+    candidate_ids_by_bloc = _inner_cambridge_sampler(
         config,
         majority_bloc,
         minority_bloc,
         rng_seed=rng_seed,
     )
 
-    profile = RankProfile()
-    for prof in pp_by_bloc.values():
-        profile += prof
-
-    if group_ballots:
-        profile = profile.group_ballots()
-
-    return profile
+    return _candidate_ids_to_profile(
+        config, np.concatenate(list(candidate_ids_by_bloc.values())), group_ballots=group_ballots
+    )
 
 
 # TODO create a more generic historical generator that CS will be a subclass of

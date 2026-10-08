@@ -15,11 +15,13 @@ from typing import Optional
 import apportionment.methods as apportion
 import numpy as np
 from numpy.random import Generator
+from numpy.typing import NDArray
 
 from votekit.ballot_generator.bloc_slate_generator.config import BlocSlateConfig
 from votekit.ballot_generator.bloc_slate_generator.slate_utils import (
     _append_zero_slate_symbols,
-    _convert_slate_ballots_to_profile,
+    _candidate_ids_to_profile,
+    _convert_slate_ballots_to_candidate_ids,
 )
 from votekit.pref_profile import RankProfile
 
@@ -35,11 +37,11 @@ def _sample_pl_slate_ballots(
     non_zero_slate_set: set[str],
     *,
     numpy_rng: Optional[Generator] = None,
-) -> list[tuple[str, ...]]:
+) -> NDArray:
     """
-    Returns a list of slate ballots; each ballot is a list of slate names (strings)
-    in the order they appear on that ballot. Only generates ballots for slates
-    that have non-zero cohesion for the given bloc.
+    Returns slate ballots as an array of indices into ``config.slates``, one row per ballot,
+    in the order the slates appear on that ballot. Only fills positions for slates that have
+    non-zero cohesion for the given bloc; remaining positions are -1.
 
 
     Args:
@@ -53,25 +55,15 @@ def _sample_pl_slate_ballots(
             time.
 
     Returns:
-        list[tuple[str, ...]]: A list of tuples, where each tuple contains the bloc names in the
-            order they appear on the ballot.
+        NDArray: n_ballots x n_candidates int8 array of slate indices, padded with -1.
     """
-    num_candidates_per_slate = {s: len(config.slate_to_candidates[s]) for s in non_zero_slate_set}
-
-    num_candidates = sum(num_candidates_per_slate.values())
-
-    ballots: list[tuple[str, ...]] = [tuple() for _ in range(num_ballots)]
+    slates = list(sorted(non_zero_slate_set))
+    num_candidates_per_slate = np.array([len(config.slate_to_candidates[s]) for s in slates])
+    num_candidates = int(num_candidates_per_slate.sum())
 
     numpy_rng = np.random.default_rng() if numpy_rng is None else numpy_rng
     rand_unif_seqs = numpy_rng.uniform(size=(num_ballots, num_candidates))
 
-    def which_bin(dist_bins: list[float], flip: float) -> int:
-        for i, left in enumerate(dist_bins[:-1]):
-            if left < flip <= dist_bins[i + 1]:
-                return i
-        return len(dist_bins) - 2
-
-    slates = list(sorted(non_zero_slate_set))
     cohesion_values_og: list[float] = []
     for slate in slates:
         cohesion_value = config.cohesion_df.loc[bloc, slate]
@@ -81,29 +73,35 @@ def _sample_pl_slate_ballots(
             )
         cohesion_values_og.append(float(cohesion_value))
 
-    for i, rand_unif_seq in enumerate(rand_unif_seqs):
-        cohesion_values = np.array(cohesion_values_og)
-        distribution_bins: list[float] = [0.0] + np.cumsum(cohesion_values).tolist()
-        ballot_type: list[str] = [""] * num_candidates
-        slate_count = {s: 0 for s in slates}
+    # Every ballot is filled one position at a time, all ballots at once. Each position picks a
+    # slate in proportion to cohesion; a slate that runs out of candidates drops out and the
+    # remaining cohesion values are renormalized.
+    cohesion_values = np.tile(cohesion_values_og, (num_ballots, 1))
+    slate_count = np.zeros(cohesion_values.shape, dtype=np.intp)
+    slate_picks = np.empty((num_ballots, num_candidates), dtype=np.intp)
+    rows = np.arange(num_ballots)
 
-        for j, rand_float in enumerate(rand_unif_seq):
-            slate_index = which_bin(distribution_bins, float(rand_float))
-            slate_type = slates[slate_index]
-            ballot_type[j] = slate_type
-            slate_count[slate_type] += 1
+    for j in range(num_candidates):
+        bin_right = np.cumsum(cohesion_values, axis=1)
+        bin_left = np.zeros_like(bin_right)
+        bin_left[:, 1:] = bin_right[:, :-1]
+        flip = rand_unif_seqs[:, j, None]
+        in_bin = (bin_left < flip) & (flip <= bin_right)
+        slate_index = np.where(in_bin.any(axis=1), in_bin.argmax(axis=1), len(slates) - 1)
 
-            if (
-                j < num_candidates - 1
-                and slate_count[slate_type] == num_candidates_per_slate[slate_type]
-            ):
-                cohesion_values[slate_index] = 0
-                cohesion_values = cohesion_values / cohesion_values.sum()
-                distribution_bins = [0.0] + np.cumsum(cohesion_values).tolist()
+        slate_picks[:, j] = slate_index
+        slate_count[rows, slate_index] += 1
 
-        ballots[i] = tuple(ballot_type)
+        if j < num_candidates - 1:
+            full = rows[slate_count[rows, slate_index] == num_candidates_per_slate[slate_index]]
+            cohesion_values[full, slate_index[full]] = 0
+            cohesion_values[full] /= cohesion_values[full].sum(axis=1, keepdims=True)
 
-    return ballots
+    slate_codes = np.full((num_ballots, len(config.candidates)), -1, dtype=np.int8)
+    config_slate_index = np.array([config.slates.index(s) for s in slates], dtype=np.int8)
+    slate_codes[:, :num_candidates] = config_slate_index[slate_picks]
+
+    return slate_codes
 
 
 # ===========================================================
@@ -115,9 +113,9 @@ def _inner_slate_plackett_luce(
     config: BlocSlateConfig,
     *,
     rng_seed: Optional[int] = None,
-) -> dict[str, RankProfile]:
+) -> dict[str, NDArray]:
     """
-    Inner function to generate preference profiles by bloc using the slate-Plackett-Luce model.
+    Inner function to generate ballots by bloc using the slate-Plackett-Luce model.
 
     This model first samples a ballot type by flipping a cohesion parameter weighted coin.
     It then fills out the ballot type via sampling without replacement from the interval
@@ -136,8 +134,8 @@ def _inner_slate_plackett_luce(
             non-deterministic results.
 
     Returns:
-        dict[str, RankProfile]: Dictionary whose keys are bloc strings and values are
-            ``RankProfile`` objects.
+        dict[str, NDArray]: Dictionary whose keys are bloc strings and values are
+            n_ballots x n_candidates arrays of indices into ``config.candidates``.
     """
     bloc_lst = config.blocs
 
@@ -152,7 +150,7 @@ def _inner_slate_plackett_luce(
 
     ballots_per_bloc = {bloc: bloc_counts[i] for i, bloc in enumerate(bloc_lst)}
 
-    pref_profile_by_bloc = {b: RankProfile() for b in bloc_lst}
+    candidate_ids_by_bloc: dict[str, NDArray] = {}
     numpy_rng = np.random.default_rng(seed=rng_seed)
 
     for bloc in bloc_lst:
@@ -176,15 +174,14 @@ def _inner_slate_plackett_luce(
             slate_ballots = _append_zero_slate_symbols(
                 slate_ballots,
                 zero_slate_set,
-                n_ballots,
                 config,
                 numpy_rng=numpy_rng,
             )
-        pref_profile_by_bloc[bloc] = _convert_slate_ballots_to_profile(
+        candidate_ids_by_bloc[bloc] = _convert_slate_ballots_to_candidate_ids(
             config, bloc, slate_ballots, numpy_rng=numpy_rng
         )
 
-    return pref_profile_by_bloc
+    return candidate_ids_by_bloc
 
 
 # =================================================
@@ -222,16 +219,11 @@ def slate_pl_profile_generator(
     """
     config.is_valid(raise_errors=True)
 
-    pp_by_bloc = _inner_slate_plackett_luce(config, rng_seed=rng_seed)
+    candidate_ids_by_bloc = _inner_slate_plackett_luce(config, rng_seed=rng_seed)
 
-    pp = RankProfile(ballots=tuple())
-    for profile in pp_by_bloc.values():
-        pp += profile
-
-    if group_ballots:
-        pp = pp.group_ballots()
-
-    return pp
+    return _candidate_ids_to_profile(
+        config, np.concatenate(list(candidate_ids_by_bloc.values())), group_ballots=group_ballots
+    )
 
 
 def slate_pl_profiles_by_bloc_generator(
@@ -266,10 +258,9 @@ def slate_pl_profiles_by_bloc_generator(
     """
     config.is_valid(raise_errors=True)
 
-    pp_by_bloc = _inner_slate_plackett_luce(config, rng_seed=rng_seed)
+    candidate_ids_by_bloc = _inner_slate_plackett_luce(config, rng_seed=rng_seed)
 
-    if group_ballots:
-        for bloc, profile in pp_by_bloc.items():
-            pp_by_bloc[bloc] = profile.group_ballots()
-
-    return pp_by_bloc
+    return {
+        bloc: _candidate_ids_to_profile(config, candidate_ids, group_ballots=group_ballots)
+        for bloc, candidate_ids in candidate_ids_by_bloc.items()
+    }

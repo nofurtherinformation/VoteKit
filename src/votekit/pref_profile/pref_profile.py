@@ -766,16 +766,23 @@ class RankProfile(PreferenceProfile):
         tilde = frozenset("~")
         assert self.max_ranking_length is not None
         ranking_cols = [f"Ranking_{i}" for i in range(1, self.max_ranking_length + 1)]
-        return (
-            self._df[ranking_cols]
-            .apply(
-                lambda row: len(
-                    frozenset.union(*(self.id_candidate_map[cand_id] for cand_id in row)) - tilde
-                ),
-                axis=1,
-            )
-            .max()
-        )
+        rankings = self._df[ranking_cols].to_numpy(dtype=np.int64)
+
+        set_sizes = np.zeros(max(self.id_candidate_map) + 2, dtype=np.int64)
+        for cand_id, cand_set in self.id_candidate_map.items():
+            set_sizes[cand_id + 1] = len(cand_set - tilde)
+        # Summing set sizes over-counts only when a ballot repeats a candidate, so it bounds each
+        # ballot from above. Take exact unions from the largest bound down until no remaining
+        # ballot can beat the best found.
+        upper_bounds = set_sizes[rankings + 1].sum(axis=1)
+
+        best = 0
+        for row in np.argsort(-upper_bounds, kind="stable"):
+            if upper_bounds[row] <= best:
+                break
+            ranked = frozenset().union(*(self.id_candidate_map[c] for c in rankings[row]))
+            best = max(best, len(ranked - tilde))
+        return best
 
     @cached_property
     def ballots(self: RankProfile) -> tuple[RankBallot, ...]:
